@@ -3,7 +3,7 @@
 use crate::{
     exec::Executable,
     gc::{Finalize, Trace},
-    syntax::ast::node::Node,
+    syntax::ast::node::NodeKind,
     Context, Result, Value,
 };
 use std::fmt;
@@ -61,7 +61,7 @@ where
     }
 }
 
-impl From<Identifier> for Node {
+impl From<Identifier> for NodeKind {
     fn from(local: Identifier) -> Self {
         Self::Identifier(local)
     }

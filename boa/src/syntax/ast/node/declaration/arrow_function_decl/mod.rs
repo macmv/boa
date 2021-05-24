@@ -2,7 +2,7 @@ use crate::{
     builtins::function::FunctionFlags,
     exec::Executable,
     gc::{Finalize, Trace},
-    syntax::ast::node::{join_nodes, FormalParameter, Node, StatementList},
+    syntax::ast::node::{join_nodes, FormalParameter, Node, NodeKind, StatementList},
     Context, Result, Value,
 };
 use std::fmt;
@@ -69,8 +69,8 @@ impl ArrowFunctionDecl {
 impl Executable for ArrowFunctionDecl {
     fn run(&self, context: &mut Context) -> Result<Value> {
         context.create_function(
-            self.params().to_vec(),
-            self.body().to_vec(),
+            self.params.clone(),
+            self.body.clone(),
             FunctionFlags::CALLABLE
                 | FunctionFlags::CONSTRUCTABLE
                 | FunctionFlags::LEXICAL_THIS_MODE,
@@ -84,7 +84,7 @@ impl fmt::Display for ArrowFunctionDecl {
     }
 }
 
-impl From<ArrowFunctionDecl> for Node {
+impl From<ArrowFunctionDecl> for NodeKind {
     fn from(decl: ArrowFunctionDecl) -> Self {
         Self::ArrowFunctionDecl(decl)
     }

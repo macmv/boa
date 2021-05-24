@@ -4,7 +4,7 @@ use crate::{
     syntax::{
         ast::{
             node::{Declaration, DeclarationList},
-            Keyword, Punctuator,
+            Keyword, Punctuator, Span,
         },
         lexer::TokenKind,
         parser::{
@@ -52,18 +52,25 @@ impl<R> TokenParser<R> for VariableStatement
 where
     R: Read,
 {
-    type Output = DeclarationList;
+    type Output = (DeclarationList, Span);
 
     fn parse(self, cursor: &mut Cursor<R>) -> Result<Self::Output, ParseError> {
         let _timer = BoaProfiler::global().start_event("VariableStatement", "Parsing");
-        cursor.expect(Keyword::Var, "variable statement")?;
 
-        let decl_list =
+        let start_token = cursor.expect(Keyword::Var, "variable statement")?;
+
+        let (decl_list, list_span) =
             VariableDeclarationList::new(true, self.allow_yield, self.allow_await).parse(cursor)?;
 
-        cursor.expect_semicolon("variable statement")?;
+        let end_token = cursor.expect_semicolon("variable statement")?;
+        let end_pos = if let Some(tk) = end_token {
+            tk.span().end()
+        } else {
+            list_span.end()
+        };
+        let span = Span::new(start_token.span().start(), end_pos);
 
-        Ok(decl_list)
+        Ok((decl_list, span))
     }
 }
 
@@ -106,15 +113,17 @@ impl<R> TokenParser<R> for VariableDeclarationList
 where
     R: Read,
 {
-    type Output = DeclarationList;
+    type Output = (DeclarationList, Span);
 
     fn parse(self, cursor: &mut Cursor<R>) -> Result<Self::Output, ParseError> {
         let mut list = Vec::new();
+        let start_pos = cursor.pos();
 
         loop {
+            let decl =  VariableDeclaration::new(self.allow_in, self.allow_yield, self.allow_await)
+            .parse(cursor)?
             list.push(
-                VariableDeclaration::new(self.allow_in, self.allow_yield, self.allow_await)
-                    .parse(cursor)?,
+               decl
             );
 
             match cursor.peek_semicolon()? {
@@ -127,7 +136,11 @@ where
             }
         }
 
-        Ok(DeclarationList::Var(list.into()))
+        let end_pos = cursor.pos();
+
+        let span = Span::new(start_pos, end_pos);
+
+        Ok((DeclarationList::Var(list.into()), span))
     }
 }
 
@@ -164,7 +177,7 @@ impl<R> TokenParser<R> for VariableDeclaration
 where
     R: Read,
 {
-    type Output = Declaration;
+    type Output = (Declaration, Span);
 
     fn parse(self, cursor: &mut Cursor<R>) -> Result<Self::Output, ParseError> {
         // TODO: BindingPattern
