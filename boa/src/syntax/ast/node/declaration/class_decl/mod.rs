@@ -3,13 +3,13 @@ use crate::{
     environment::lexical_environment::VariableScope,
     exec::Executable,
     gc::{Finalize, Trace},
-    object::{GcObject, Object, PROTOTYPE},
-    property::{AccessorDescriptor, Attribute, PropertyDescriptor},
+    object::{JsObject as GcObject, Object, PROTOTYPE},
+    property::PropertyDescriptor,
     syntax::{
-        ast::node::{FunctionDecl, Node},
+        ast::node::{FunctionDecl, Node, StatementList},
         parser::class::ClassField,
     },
-    BoaProfiler, Context, Result, Value,
+    BoaProfiler, Context, JsResult as Result, JsValue as Value,
 };
 use std::fmt;
 
@@ -164,9 +164,10 @@ impl ClassDecl {
             match f {
                 ClassField::Method(method) => {
                     let f = context.create_function(
+                        "",
                         method.parameters().to_vec(),
-                        method.body().to_vec(),
-                        FunctionFlags::CALLABLE | FunctionFlags::CONSTRUCTABLE,
+                        method.body().clone(),
+                        FunctionFlags::CONSTRUCTABLE,
                     )?;
                     obj.set_field(method.name(), f, false, context)?;
                 }
@@ -177,50 +178,56 @@ impl ClassDecl {
                     let set = obj
                         .get_property(method.name())
                         .as_ref()
-                        .and_then(|p| p.as_accessor_descriptor())
-                        .and_then(|a| a.setter().cloned());
+                        .and_then(|a| a.set())
+                        .cloned();
                     // Creates a getter and setter for the object. We
                     // use the pre-existing setter here, and a custom getter.
                     obj.set_property(
                         method.name(),
-                        PropertyDescriptor::Accessor(AccessorDescriptor {
-                            get: context
-                                .create_function(
-                                    method.parameters().to_vec(),
-                                    method.body().to_vec(),
-                                    FunctionFlags::CALLABLE,
-                                )?
-                                .as_object(),
-                            set,
-                            attributes: Attribute::WRITABLE
-                                | Attribute::ENUMERABLE
-                                | Attribute::CONFIGURABLE,
-                        }),
+                        PropertyDescriptor::builder()
+                            .get(
+                                context
+                                    .create_function(
+                                        "",
+                                        method.parameters().to_vec(),
+                                        method.body().clone(),
+                                        FunctionFlags::empty(),
+                                    )?
+                                    .as_object(),
+                            )
+                            .set(set)
+                            .configurable(true)
+                            .enumerable(true)
+                            .writable(true)
+                            .build(),
                     )
                 }
                 ClassField::Setter(method) => {
                     let get = obj
                         .get_property(method.name())
                         .as_ref()
-                        .and_then(|p| p.as_accessor_descriptor())
-                        .and_then(|a| a.getter().cloned());
+                        .and_then(|a| a.set())
+                        .cloned();
                     // Creates a getter and setter for the object. We
                     // use the pre-existing getter here, and a custom setter.
                     obj.set_property(
                         method.name(),
-                        PropertyDescriptor::Accessor(AccessorDescriptor {
-                            get,
-                            set: context
-                                .create_function(
-                                    method.parameters().to_vec(),
-                                    method.body().to_vec(),
-                                    FunctionFlags::CALLABLE,
-                                )?
-                                .as_object(),
-                            attributes: Attribute::WRITABLE
-                                | Attribute::ENUMERABLE
-                                | Attribute::CONFIGURABLE,
-                        }),
+                        PropertyDescriptor::builder()
+                            .get(get)
+                            .set(
+                                context
+                                    .create_function(
+                                        "",
+                                        method.parameters().to_vec(),
+                                        method.body().clone(),
+                                        FunctionFlags::empty(),
+                                    )?
+                                    .as_object(),
+                            )
+                            .configurable(true)
+                            .enumerable(true)
+                            .writable(true)
+                            .build(),
                     )
                 }
             }
@@ -234,14 +241,16 @@ impl Executable for ClassDecl {
         let _timer = BoaProfiler::global().start_event("ClassDecl", "exec");
         let class = match &self.constructor {
             Some(c) => context.create_function(
+                "",
                 c.parameters().to_vec(),
-                c.body().to_vec(),
-                FunctionFlags::CALLABLE | FunctionFlags::CONSTRUCTABLE,
+                c.body().clone(),
+                FunctionFlags::CONSTRUCTABLE,
             )?,
             None => context.create_function(
+                "",
                 vec![],
-                vec![],
-                FunctionFlags::CALLABLE | FunctionFlags::CONSTRUCTABLE,
+                StatementList::from(vec![]),
+                FunctionFlags::CONSTRUCTABLE,
             )?,
         };
 
@@ -256,7 +265,7 @@ impl Executable for ClassDecl {
         // Setup static things
         ClassDecl::add_fields_to_obj(&self.static_fields, &class, context)?;
 
-        context.create_mutable_binding(self.name().to_owned(), false, VariableScope::Function)?;
+        context.create_mutable_binding(self.name(), false, VariableScope::Function)?;
         context.initialize_binding(self.name(), class)?;
         Ok(Value::undefined())
     }
