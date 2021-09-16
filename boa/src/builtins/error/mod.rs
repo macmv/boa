@@ -12,10 +12,11 @@
 
 use crate::{
     builtins::BuiltIn,
-    object::{ConstructorBuilder, ObjectData, PROTOTYPE},
+    context::StandardObjects,
+    object::{internal_methods::get_prototype_from_constructor, ConstructorBuilder, ObjectData},
     profiler::BoaProfiler,
     property::Attribute,
-    Context, Result, Value,
+    Context, JsResult, JsValue,
 };
 
 pub(crate) mod eval;
@@ -46,7 +47,7 @@ impl BuiltIn for Error {
         Attribute::WRITABLE | Attribute::NON_ENUMERABLE | Attribute::CONFIGURABLE
     }
 
-    fn init(context: &mut Context) -> (&'static str, Value, Attribute) {
+    fn init(context: &mut Context) -> (&'static str, JsValue, Attribute) {
         let _timer = BoaProfiler::global().start_event(Self::NAME, "init");
 
         let attribute = Attribute::WRITABLE | Attribute::NON_ENUMERABLE | Attribute::CONFIGURABLE;
@@ -74,22 +75,15 @@ impl Error {
     ///
     /// Create a new error object.
     pub(crate) fn constructor(
-        new_target: &Value,
-        args: &[Value],
+        new_target: &JsValue,
+        args: &[JsValue],
         context: &mut Context,
-    ) -> Result<Value> {
-        let prototype = new_target
-            .as_object()
-            .and_then(|obj| {
-                obj.get(&PROTOTYPE.into(), obj.clone().into(), context)
-                    .map(|o| o.as_object())
-                    .transpose()
-            })
-            .transpose()?
-            .unwrap_or_else(|| context.standard_objects().error_object().prototype());
-        let mut obj = context.construct_object();
+    ) -> JsResult<JsValue> {
+        let prototype =
+            get_prototype_from_constructor(new_target, StandardObjects::error_object, context)?;
+        let obj = context.construct_object();
         obj.set_prototype_instance(prototype.into());
-        let this = Value::from(obj);
+        let this = JsValue::new(obj);
         if let Some(message) = args.get(0) {
             if !message.is_undefined() {
                 this.set_field("message", message.to_string(context)?, false, context)?;
@@ -98,7 +92,7 @@ impl Error {
 
         // This value is used by console.log and other routines to match Object type
         // to its Javascript Identifier (global constructor method name)
-        this.set_data(ObjectData::Error);
+        this.set_data(ObjectData::error());
         Ok(this)
     }
 
@@ -113,7 +107,11 @@ impl Error {
     /// [spec]: https://tc39.es/ecma262/#sec-error.prototype.tostring
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Error/toString
     #[allow(clippy::wrong_self_convention)]
-    pub(crate) fn to_string(this: &Value, _: &[Value], context: &mut Context) -> Result<Value> {
+    pub(crate) fn to_string(
+        this: &JsValue,
+        _: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
         if !this.is_object() {
             return context.throw_type_error("'this' is not an Object");
         }

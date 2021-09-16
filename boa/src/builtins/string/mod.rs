@@ -14,17 +14,16 @@ pub mod string_iterator;
 mod tests;
 
 use crate::builtins::Symbol;
-use crate::object::PROTOTYPE;
-use crate::property::DataDescriptor;
+use crate::context::StandardObjects;
+use crate::object::internal_methods::get_prototype_from_constructor;
+use crate::object::JsObject;
 use crate::{
     builtins::{string::string_iterator::StringIterator, Array, BuiltIn, RegExp},
-    object::{ConstructorBuilder, Object, ObjectData},
-    property::Attribute,
+    object::{ConstructorBuilder, ObjectData},
+    property::{Attribute, PropertyDescriptor},
     symbol::WellKnownSymbols,
-    value::{RcString, Value},
-    BoaProfiler, Context, Result,
+    BoaProfiler, Context, JsResult, JsString, JsValue,
 };
-use regress::Regex;
 use std::{
     char::{decode_utf16, from_u32},
     cmp::{max, min},
@@ -32,7 +31,9 @@ use std::{
 };
 use unicode_normalization::UnicodeNormalization;
 
-pub(crate) fn code_point_at(string: RcString, position: i32) -> Option<(u32, u8, bool)> {
+use super::JsArgs;
+
+pub(crate) fn code_point_at(string: JsString, position: i32) -> Option<(u32, u8, bool)> {
     let size = string.encode_utf16().count() as i32;
     if position < 0 || position >= size {
         return None;
@@ -74,11 +75,11 @@ pub(crate) fn is_trimmable_whitespace(c: char) -> bool {
     )
 }
 
-fn is_leading_surrogate(value: u16) -> bool {
+pub(crate) fn is_leading_surrogate(value: u16) -> bool {
     (0xD800..=0xDBFF).contains(&value)
 }
 
-fn is_trailing_surrogate(value: u16) -> bool {
+pub(crate) fn is_trailing_surrogate(value: u16) -> bool {
     (0xDC00..=0xDFFF).contains(&value)
 }
 
@@ -93,7 +94,7 @@ impl BuiltIn for String {
         Attribute::WRITABLE | Attribute::NON_ENUMERABLE | Attribute::CONFIGURABLE
     }
 
-    fn init(context: &mut Context) -> (&'static str, Value, Attribute) {
+    fn init(context: &mut Context) -> (&'static str, JsValue, Attribute) {
         let _timer = BoaProfiler::global().start_event(Self::NAME, "init");
 
         let symbol_iterator = WellKnownSymbols::iterator();
@@ -134,8 +135,10 @@ impl BuiltIn for String {
         .method(Self::value_of, "valueOf", 0)
         .method(Self::match_all, "matchAll", 1)
         .method(Self::replace, "replace", 2)
+        .method(Self::replace_all, "replaceAll", 2)
         .method(Self::iterator, (symbol_iterator, "[Symbol.iterator]"), 0)
         .method(Self::search, "search", 1)
+        .method(Self::at, "at", 1)
         .build();
 
         (Self::NAME, string_object.into(), Self::attribute())
@@ -157,10 +160,10 @@ impl String {
     ///
     /// <https://tc39.es/ecma262/#sec-string-constructor-string-value>
     pub(crate) fn constructor(
-        new_target: &Value,
-        args: &[Value],
+        new_target: &JsValue,
+        args: &[JsValue],
         context: &mut Context,
-    ) -> Result<Value> {
+    ) -> JsResult<JsValue> {
         // This value is used by console.log and other routines to match Object type
         // to its Javascript Identifier (global constructor method name)
         let string = match args.get(0) {
@@ -170,43 +173,62 @@ impl String {
                     .expect("'Symbol::to_string' returns 'Value::String'")
                     .clone()
             }
-            Some(ref value) => value.to_string(context)?,
-            None => RcString::default(),
+            Some(value) => value.to_string(context)?,
+            None => JsString::default(),
         };
 
         if new_target.is_undefined() {
             return Ok(string.into());
         }
-        let prototype = new_target
-            .as_object()
-            .and_then(|obj| {
-                obj.get(&PROTOTYPE.into(), obj.clone().into(), context)
-                    .map(|o| o.as_object())
-                    .transpose()
-            })
-            .transpose()?
-            .unwrap_or_else(|| context.standard_objects().object_object().prototype());
-        let this = Value::new_object(context);
 
-        this.as_object()
-            .expect("this should be an object")
-            .set_prototype_instance(prototype.into());
-
-        let length = DataDescriptor::new(
-            Value::from(string.encode_utf16().count()),
-            Attribute::NON_ENUMERABLE,
-        );
-        this.set_property("length", length);
-
-        this.set_data(ObjectData::String(string));
-
-        Ok(this)
+        let prototype =
+            get_prototype_from_constructor(new_target, StandardObjects::string_object, context)?;
+        Ok(Self::string_create(string, prototype, context).into())
     }
 
-    fn this_string_value(this: &Value, context: &mut Context) -> Result<RcString> {
+    /// Abstract function `StringCreate( value, prototype )`.
+    ///
+    /// Call this function if you want to create a `String` exotic object.
+    ///
+    /// More information:
+    ///  - [ECMAScript reference][spec]
+    ///
+    /// [spec]: https://tc39.es/ecma262/#sec-stringcreate
+    fn string_create(value: JsString, prototype: JsObject, context: &mut Context) -> JsObject {
+        // 7. Let length be the number of code unit elements in value.
+        let len = value.encode_utf16().count();
+
+        // 1. Let S be ! MakeBasicObject(« [[Prototype]], [[Extensible]], [[StringData]] »).
+        // 2. Set S.[[Prototype]] to prototype.
+        // 3. Set S.[[StringData]] to value.
+        // 4. Set S.[[GetOwnProperty]] as specified in 10.4.3.1.
+        // 5. Set S.[[DefineOwnProperty]] as specified in 10.4.3.2.
+        // 6. Set S.[[OwnPropertyKeys]] as specified in 10.4.3.3.
+        let s = context.construct_object();
+        s.set_prototype_instance(prototype.into());
+        s.borrow_mut().data = ObjectData::string(value);
+
+        // 8. Perform ! DefinePropertyOrThrow(S, "length", PropertyDescriptor { [[Value]]: 𝔽(length),
+        // [[Writable]]: false, [[Enumerable]]: false, [[Configurable]]: false }).
+        s.define_property_or_throw(
+            "length",
+            PropertyDescriptor::builder()
+                .value(len)
+                .writable(false)
+                .enumerable(false)
+                .configurable(false),
+            context,
+        )
+        .expect("length definition for a new string must not fail");
+
+        // 9. Return S.
+        s
+    }
+
+    fn this_string_value(this: &JsValue, context: &mut Context) -> JsResult<JsString> {
         match this {
-            Value::String(ref string) => return Ok(string.clone()),
-            Value::Object(ref object) => {
+            JsValue::String(ref string) => return Ok(string.clone()),
+            JsValue::Object(ref object) => {
                 let object = object.borrow();
                 if let Some(string) = object.as_string() {
                     return Ok(string);
@@ -221,9 +243,13 @@ impl String {
     /// Get the string value to a primitive string
     #[allow(clippy::wrong_self_convention)]
     #[inline]
-    pub(crate) fn to_string(this: &Value, _: &[Value], context: &mut Context) -> Result<Value> {
+    pub(crate) fn to_string(
+        this: &JsValue,
+        _: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
         // Get String from String Object and send it back as a new value
-        Ok(Value::from(Self::this_string_value(this, context)?))
+        Ok(JsValue::new(Self::this_string_value(this, context)?))
     }
 
     /// `String.prototype.charAt( index )`
@@ -242,14 +268,18 @@ impl String {
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.charat
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/charAt
-    pub(crate) fn char_at(this: &Value, args: &[Value], context: &mut Context) -> Result<Value> {
+    pub(crate) fn char_at(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
         // First we get it the actual string a private field stored on the object only the context has access to.
         // Then we convert it into a Rust String by wrapping it in from_value
         let primitive_val = this.to_string(context)?;
         let pos = args
             .get(0)
             .cloned()
-            .unwrap_or_else(Value::undefined)
+            .unwrap_or_else(JsValue::undefined)
             .to_integer(context)? as i32;
 
         // Fast path returning empty string when pos is obviously out of range
@@ -262,9 +292,44 @@ impl String {
         // Note that this is an O(N) operation (because UTF-8 is complex) while getting the number of
         // bytes is an O(1) operation.
         if let Some(utf16_val) = primitive_val.encode_utf16().nth(pos as usize) {
-            Ok(Value::from(from_u32(utf16_val as u32).unwrap()))
+            Ok(JsValue::new(from_u32(utf16_val as u32).unwrap()))
         } else {
             Ok("".into())
+        }
+    }
+
+    /// `String.prototype.at ( index )`
+    ///
+    /// This String object's at() method returns a String consisting of the single UTF-16 code unit located at the specified position.
+    /// Returns undefined if the given index cannot be found.
+    ///
+    /// More information:
+    ///  - [ECMAScript reference][spec]
+    ///  - [MDN documentation][mdn]
+    ///
+    /// [spec]: https://tc39.es/proposal-relative-indexing-method/#sec-string.prototype.at
+    /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/at
+    pub(crate) fn at(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+        let this = this.require_object_coercible(context)?;
+        let s = this.to_string(context)?;
+        let len = s.encode_utf16().count();
+        let relative_index = args
+            .get(0)
+            .cloned()
+            .unwrap_or_default()
+            .to_integer(context)?;
+        let k = if relative_index < 0 as f64 {
+            len - (-relative_index as usize)
+        } else {
+            relative_index as usize
+        };
+
+        if let Some(utf16_val) = s.encode_utf16().nth(k) {
+            Ok(JsValue::new(
+                from_u32(u32::from(utf16_val)).expect("invalid utf-16 character"),
+            ))
+        } else {
+            Ok(JsValue::undefined())
         }
     }
 
@@ -283,28 +348,28 @@ impl String {
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.codepointat
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/codePointAt
     pub(crate) fn code_point_at(
-        this: &Value,
-        args: &[Value],
+        this: &JsValue,
+        args: &[JsValue],
         context: &mut Context,
-    ) -> Result<Value> {
+    ) -> JsResult<JsValue> {
         // First we get it the actual string a private field stored on the object only the context has access to.
         // Then we convert it into a Rust String by wrapping it in from_value
         let primitive_val = this.to_string(context)?;
         let pos = args
             .get(0)
             .cloned()
-            .unwrap_or_else(Value::undefined)
+            .unwrap_or_else(JsValue::undefined)
             .to_integer(context)? as i32;
 
         // Fast path returning undefined when pos is obviously out of range
         if pos < 0 || pos >= primitive_val.len() as i32 {
-            return Ok(Value::undefined());
+            return Ok(JsValue::undefined());
         }
 
         if let Some((code_point, _, _)) = code_point_at(primitive_val, pos) {
-            Ok(Value::from(code_point))
+            Ok(JsValue::new(code_point))
         } else {
-            Ok(Value::undefined())
+            Ok(JsValue::undefined())
         }
     }
 
@@ -323,31 +388,31 @@ impl String {
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.charcodeat
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/charCodeAt
     pub(crate) fn char_code_at(
-        this: &Value,
-        args: &[Value],
+        this: &JsValue,
+        args: &[JsValue],
         context: &mut Context,
-    ) -> Result<Value> {
+    ) -> JsResult<JsValue> {
         // First we get it the actual string a private field stored on the object only the context has access to.
         // Then we convert it into a Rust String by wrapping it in from_value
         let primitive_val = this.to_string(context)?;
         let pos = args
             .get(0)
             .cloned()
-            .unwrap_or_else(Value::undefined)
+            .unwrap_or_else(JsValue::undefined)
             .to_integer(context)? as i32;
 
         // Fast path returning NaN when pos is obviously out of range
         if pos < 0 || pos >= primitive_val.len() as i32 {
-            return Ok(Value::nan());
+            return Ok(JsValue::nan());
         }
 
         // Calling .len() on a string would give the wrong result, as they are bytes not the number of unicode code points
         // Note that this is an O(N) operation (because UTF-8 is complex) while getting the number of bytes is an O(1) operation.
         // If there is no element at that index, the result is NaN
         if let Some(utf16_val) = primitive_val.encode_utf16().nth(pos as usize) {
-            Ok(Value::from(f64::from(utf16_val)))
+            Ok(JsValue::new(f64::from(utf16_val)))
         } else {
-            Ok(Value::nan())
+            Ok(JsValue::nan())
         }
     }
 
@@ -365,7 +430,11 @@ impl String {
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.concat
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/concat
-    pub(crate) fn concat(this: &Value, args: &[Value], context: &mut Context) -> Result<Value> {
+    pub(crate) fn concat(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
         let object = this.require_object_coercible(context)?;
         let mut string = object.to_string(context)?.to_string();
 
@@ -373,7 +442,7 @@ impl String {
             string.push_str(&arg.to_string(context)?);
         }
 
-        Ok(Value::from(string))
+        Ok(JsValue::new(string))
     }
 
     /// `String.prototype.repeat( count )`
@@ -387,7 +456,11 @@ impl String {
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.repeat
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/repeat
-    pub(crate) fn repeat(this: &Value, args: &[Value], context: &mut Context) -> Result<Value> {
+    pub(crate) fn repeat(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
         let object = this.require_object_coercible(context)?;
         let string = object.to_string(context)?;
 
@@ -421,7 +494,11 @@ impl String {
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.slice
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/slice
-    pub(crate) fn slice(this: &Value, args: &[Value], context: &mut Context) -> Result<Value> {
+    pub(crate) fn slice(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
         // First we get it the actual string a private field stored on the object only the context has access to.
         // Then we convert it into a Rust String by wrapping it in from_value
         let primitive_val = this.to_string(context)?;
@@ -433,12 +510,12 @@ impl String {
         let start = args
             .get(0)
             .cloned()
-            .unwrap_or_else(Value::undefined)
+            .unwrap_or_else(JsValue::undefined)
             .to_integer(context)? as i32;
         let end = args
             .get(1)
             .cloned()
-            .unwrap_or_else(|| Value::integer(length))
+            .unwrap_or_else(|| JsValue::new(length))
             .to_integer(context)? as i32;
 
         let from = if start < 0 {
@@ -459,7 +536,7 @@ impl String {
             .skip(from as usize)
             .take(span as usize)
             .collect();
-        Ok(Value::from(new_str))
+        Ok(JsValue::new(new_str))
     }
 
     /// `String.prototype.startWith( searchString[, position] )`
@@ -473,17 +550,17 @@ impl String {
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.startswith
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/startsWith
     pub(crate) fn starts_with(
-        this: &Value,
-        args: &[Value],
+        this: &JsValue,
+        args: &[JsValue],
         context: &mut Context,
-    ) -> Result<Value> {
+    ) -> JsResult<JsValue> {
         // First we get it the actual string a private field stored on the object only the context has access to.
         // Then we convert it into a Rust String by wrapping it in from_value
         let primitive_val = this.to_string(context)?;
 
-        let arg = args.get(0).cloned().unwrap_or_else(Value::undefined);
+        let arg = args.get_or_undefined(0);
 
-        if Self::is_regexp_object(&arg) {
+        if Self::is_regexp_object(arg) {
             context.throw_type_error(
                 "First argument to String.prototype.startsWith must not be a regular expression",
             )?;
@@ -495,23 +572,23 @@ impl String {
         let search_length = search_string.chars().count() as i32;
 
         // If less than 2 args specified, position is 'undefined', defaults to 0
-        let position = if args.len() < 2 {
-            0
+        let position = if let Some(integer) = args.get(1) {
+            integer.to_integer(context)? as i32
         } else {
-            args.get(1)
-                .expect("failed to get arg")
-                .to_integer(context)? as i32
+            0
         };
 
         let start = min(max(position, 0), length);
         let end = start.wrapping_add(search_length);
 
         if end > length {
-            Ok(Value::from(false))
+            Ok(JsValue::new(false))
         } else {
             // Only use the part of the string from "start"
             let this_string: StdString = primitive_val.chars().skip(start as usize).collect();
-            Ok(Value::from(this_string.starts_with(search_string.as_str())))
+            Ok(JsValue::new(
+                this_string.starts_with(search_string.as_str()),
+            ))
         }
     }
 
@@ -525,14 +602,18 @@ impl String {
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.endswith
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/endsWith
-    pub(crate) fn ends_with(this: &Value, args: &[Value], context: &mut Context) -> Result<Value> {
+    pub(crate) fn ends_with(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
         // First we get it the actual string a private field stored on the object only the context has access to.
         // Then we convert it into a Rust String by wrapping it in from_value
         let primitive_val = this.to_string(context)?;
 
-        let arg = args.get(0).cloned().unwrap_or_else(Value::undefined);
+        let arg = args.get_or_undefined(0);
 
-        if Self::is_regexp_object(&arg) {
+        if Self::is_regexp_object(arg) {
             context.throw_type_error(
                 "First argument to String.prototype.endsWith must not be a regular expression",
             )?;
@@ -545,23 +626,21 @@ impl String {
 
         // If less than 2 args specified, end_position is 'undefined', defaults to
         // length of this
-        let end_position = if args.len() < 2 {
-            length
+        let end_position = if let Some(integer) = args.get(1) {
+            integer.to_integer(context)? as i32
         } else {
-            args.get(1)
-                .expect("Could not get argumetn")
-                .to_integer(context)? as i32
+            length
         };
 
         let end = min(max(end_position, 0), length);
         let start = end.wrapping_sub(search_length);
 
         if start < 0 {
-            Ok(Value::from(false))
+            Ok(JsValue::new(false))
         } else {
             // Only use the part of the string up to "end"
             let this_string: StdString = primitive_val.chars().take(end as usize).collect();
-            Ok(Value::from(this_string.ends_with(search_string.as_str())))
+            Ok(JsValue::new(this_string.ends_with(search_string.as_str())))
         }
     }
 
@@ -575,14 +654,18 @@ impl String {
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.includes
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/includes
-    pub(crate) fn includes(this: &Value, args: &[Value], context: &mut Context) -> Result<Value> {
+    pub(crate) fn includes(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
         // First we get it the actual string a private field stored on the object only the context has access to.
         // Then we convert it into a Rust String by wrapping it in from_value
         let primitive_val = this.to_string(context)?;
 
-        let arg = args.get(0).cloned().unwrap_or_else(Value::undefined);
+        let arg = args.get_or_undefined(0);
 
-        if Self::is_regexp_object(&arg) {
+        if Self::is_regexp_object(arg) {
             context.throw_type_error(
                 "First argument to String.prototype.includes must not be a regular expression",
             )?;
@@ -593,12 +676,11 @@ impl String {
         let length = primitive_val.chars().count() as i32;
 
         // If less than 2 args specified, position is 'undefined', defaults to 0
-        let position = if args.len() < 2 {
-            0
+
+        let position = if let Some(integer) = args.get(1) {
+            integer.to_integer(context)? as i32
         } else {
-            args.get(1)
-                .expect("Could not get argument")
-                .to_integer(context)? as i32
+            0
         };
 
         let start = min(max(position, 0), length);
@@ -606,29 +688,12 @@ impl String {
         // Take the string from "this" and use only the part of it after "start"
         let this_string: StdString = primitive_val.chars().skip(start as usize).collect();
 
-        Ok(Value::from(this_string.contains(search_string.as_str())))
+        Ok(JsValue::new(this_string.contains(search_string.as_str())))
     }
 
-    /// Return either the string itself or the string of the regex equivalent
-    fn get_regex_string(value: &Value) -> StdString {
+    fn is_regexp_object(value: &JsValue) -> bool {
         match value {
-            Value::String(ref body) => body.to_string(),
-            Value::Object(ref obj) => {
-                let obj = obj.borrow();
-
-                if let Some(regexp) = obj.as_regexp() {
-                    // first argument is another `RegExp` object, so copy its pattern and flags
-                    return regexp.original_source.clone().into();
-                }
-                "undefined".to_string()
-            }
-            _ => "undefined".to_string(),
-        }
-    }
-
-    fn is_regexp_object(value: &Value) -> bool {
-        match value {
-            Value::Object(ref obj) => obj.borrow().is_regexp(),
+            JsValue::Object(ref obj) => obj.borrow().is_regexp(),
             _ => false,
         }
     }
@@ -648,150 +713,277 @@ impl String {
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.replace
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/replace
-    pub(crate) fn replace(this: &Value, args: &[Value], context: &mut Context) -> Result<Value> {
-        // TODO: Support Symbol replacer
-        let primitive_val = this.to_string(context)?;
-        if args.is_empty() {
-            return Ok(Value::from(primitive_val));
+    pub(crate) fn replace(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
+        // 1. Let O be ? RequireObjectCoercible(this value).
+        this.require_object_coercible(context)?;
+
+        let search_value = args.get_or_undefined(0);
+
+        let replace_value = args.get_or_undefined(1);
+
+        // 2. If searchValue is neither undefined nor null, then
+        if !search_value.is_null_or_undefined() {
+            // a. Let replacer be ? GetMethod(searchValue, @@replace).
+            let replacer = search_value
+                .as_object()
+                .unwrap_or_default()
+                .get_method(context, WellKnownSymbols::replace())?;
+
+            // b. If replacer is not undefined, then
+            if let Some(replacer) = replacer {
+                // i. Return ? Call(replacer, searchValue, « O, replaceValue »).
+                return context.call(
+                    &replacer.into(),
+                    search_value,
+                    &[this.clone(), replace_value.clone()],
+                );
+            }
         }
 
-        let regex_body = Self::get_regex_string(args.get(0).expect("Value needed"));
-        let re = Regex::new(&regex_body).expect("unable to convert regex to regex object");
-        let mat = match re.find(&primitive_val) {
-            Some(mat) => mat,
-            None => return Ok(Value::from(primitive_val)),
-        };
-        let caps = re
-            .find(&primitive_val)
-            .expect("unable to get capture groups from text")
-            .captures;
+        // 3. Let string be ? ToString(O).
+        let this_str = this.to_string(context)?;
 
-        let replace_value = if args.len() > 1 {
-            // replace_object could be a string or function or not exist at all
-            let replace_object: &Value = args.get(1).expect("second argument expected");
-            match replace_object {
-                Value::String(val) => {
-                    // https://tc39.es/ecma262/#table-45
-                    let mut result = StdString::new();
-                    let mut chars = val.chars().peekable();
+        // 4. Let searchString be ? ToString(searchValue).
+        let search_str = search_value.to_string(context)?;
 
-                    let m = caps.len();
+        // 5. Let functionalReplace be IsCallable(replaceValue).
+        let functional_replace = replace_value.is_function();
 
-                    while let Some(first) = chars.next() {
-                        if first == '$' {
-                            let second = chars.next();
-                            let second_is_digit = second.map_or(false, |ch| ch.is_digit(10));
-                            // we use peek so that it is still in the iterator if not used
-                            let third = if second_is_digit { chars.peek() } else { None };
-                            let third_is_digit = third.map_or(false, |ch| ch.is_digit(10));
+        // 6. If functionalReplace is false, then
+        // a. Set replaceValue to ? ToString(replaceValue).
 
-                            match (second, third) {
-                                (Some('$'), _) => {
-                                    // $$
-                                    result.push('$');
-                                }
-                                (Some('&'), _) => {
-                                    // $&
-                                    result.push_str(&primitive_val[mat.range()]);
-                                }
-                                (Some('`'), _) => {
-                                    // $`
-                                    let start_of_match = mat.start();
-                                    result.push_str(&primitive_val[..start_of_match]);
-                                }
-                                (Some('\''), _) => {
-                                    // $'
-                                    let end_of_match = mat.end();
-                                    result.push_str(&primitive_val[end_of_match..]);
-                                }
-                                (Some(second), Some(third))
-                                    if second_is_digit && third_is_digit =>
-                                {
-                                    // $nn
-                                    let tens = second.to_digit(10).unwrap() as usize;
-                                    let units = third.to_digit(10).unwrap() as usize;
-                                    let nn = 10 * tens + units;
-                                    if nn == 0 || nn > m {
-                                        result.push(first);
-                                        result.push(second);
-                                        if let Some(ch) = chars.next() {
-                                            result.push(ch);
-                                        }
-                                    } else {
-                                        let group = match mat.group(nn) {
-                                            Some(range) => &primitive_val[range.clone()],
-                                            _ => "",
-                                        };
-                                        result.push_str(group);
-                                        chars.next(); // consume third
-                                    }
-                                }
-                                (Some(second), _) if second_is_digit => {
-                                    // $n
-                                    let n = second.to_digit(10).unwrap() as usize;
-                                    if n == 0 || n > m {
-                                        result.push(first);
-                                        result.push(second);
-                                    } else {
-                                        let group = match mat.group(n) {
-                                            Some(range) => &primitive_val[range.clone()],
-                                            _ => "",
-                                        };
-                                        result.push_str(group);
-                                    }
-                                }
-                                (Some('<'), _) => {
-                                    // $<
-                                    // TODO: named capture groups
-                                    result.push_str("$<");
-                                }
-                                _ => {
-                                    // $?, ? is none of the above
-                                    // we can consume second because it isn't $
-                                    result.push(first);
-                                    if let Some(second) = second {
-                                        result.push(second);
-                                    }
-                                }
-                            }
-                        } else {
-                            result.push(first);
-                        }
-                    }
+        // 7. Let searchLength be the length of searchString.
+        let search_length = search_str.len();
 
-                    result
-                }
-                Value::Object(_) => {
-                    // This will return the matched substring first, then captured parenthesized groups later
-                    let mut results: Vec<Value> = mat
-                        .groups()
-                        .map(|group| match group {
-                            Some(range) => Value::from(&primitive_val[range]),
-                            None => Value::undefined(),
-                        })
-                        .collect();
-
-                    // Returns the starting byte offset of the match
-                    let start = mat.start();
-                    results.push(Value::from(start));
-                    // Push the whole string being examined
-                    results.push(Value::from(primitive_val.to_string()));
-
-                    let result = context.call(&replace_object, this, &results)?;
-
-                    result.to_string(context)?.to_string()
-                }
-                _ => "undefined".to_string(),
-            }
+        // 8. Let position be ! StringIndexOf(string, searchString, 0).
+        // 9. If position is -1, return string.
+        let position = if let Some(p) = this_str.index_of(&search_str, 0) {
+            p
         } else {
-            "undefined".to_string()
+            return Ok(this_str.into());
         };
 
-        Ok(Value::from(primitive_val.replacen(
-            &primitive_val[mat.range()],
-            &replace_value,
-            1,
-        )))
+        // 10. Let preserved be the substring of string from 0 to position.
+        let preserved = StdString::from_utf16_lossy(
+            &this_str.encode_utf16().take(position).collect::<Vec<u16>>(),
+        );
+
+        // 11. If functionalReplace is true, then
+        // 12. Else,
+        let replacement = if functional_replace {
+            // a. Let replacement be ? ToString(? Call(replaceValue, undefined, « searchString, 𝔽(position), string »)).
+            context
+                .call(
+                    replace_value,
+                    &JsValue::undefined(),
+                    &[search_str.into(), position.into(), this_str.clone().into()],
+                )?
+                .to_string(context)?
+        } else {
+            // a. Assert: Type(replaceValue) is String.
+            // b. Let captures be a new empty List.
+            let captures = Vec::new();
+
+            // c. Let replacement be ! GetSubstitution(searchString, string, position, captures, undefined, replaceValue).
+            get_substitution(
+                search_str.to_string(),
+                this_str.to_string(),
+                position,
+                captures,
+                JsValue::undefined(),
+                replace_value.to_string(context)?,
+                context,
+            )?
+        };
+
+        // 13. Return the string-concatenation of preserved, replacement, and the substring of string from position + searchLength.
+        Ok(format!(
+            "{}{}{}",
+            preserved,
+            replacement,
+            StdString::from_utf16_lossy(
+                &this_str
+                    .encode_utf16()
+                    .skip(position + search_length)
+                    .collect::<Vec<u16>>()
+            )
+        )
+        .into())
+    }
+
+    /// `22.1.3.18 String.prototype.replaceAll ( searchValue, replaceValue )`
+    ///
+    /// The replaceAll() method returns a new string with all matches of a pattern replaced by a replacement.
+    ///
+    /// The pattern can be a string or a RegExp, and the replacement can be a string or a function to be called for each match.
+    ///
+    /// The original string is left unchanged.
+    ///
+    /// More information:
+    ///  - [ECMAScript reference][spec]
+    ///  - [MDN documentation][mdn]
+    ///
+    /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.replaceall
+    /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/replace
+    pub(crate) fn replace_all(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
+        // 1. Let O be ? RequireObjectCoercible(this value).
+        let o = this.require_object_coercible(context)?;
+
+        let search_value = args.get_or_undefined(0);
+        let replace_value = args.get_or_undefined(1);
+
+        // 2. If searchValue is neither undefined nor null, then
+        if !search_value.is_null_or_undefined() {
+            // a. Let isRegExp be ? IsRegExp(searchValue).
+            if let Some(obj) = search_value.as_object() {
+                // b. If isRegExp is true, then
+                if obj.is_regexp() {
+                    // i. Let flags be ? Get(searchValue, "flags").
+                    let flags = obj.get("flags", context)?;
+
+                    // ii. Perform ? RequireObjectCoercible(flags).
+                    flags.require_object_coercible(context)?;
+
+                    // iii. If ? ToString(flags) does not contain "g", throw a TypeError exception.
+                    if !flags.to_string(context)?.contains('g') {
+                        return context.throw_type_error(
+                            "String.prototype.replaceAll called with a non-global RegExp argument",
+                        );
+                    }
+                }
+            }
+
+            // c. Let replacer be ? GetMethod(searchValue, @@replace).
+            let replacer = search_value
+                .as_object()
+                .unwrap_or_default()
+                .get_method(context, WellKnownSymbols::replace())?;
+
+            // d. If replacer is not undefined, then
+            if let Some(replacer) = replacer {
+                // i. Return ? Call(replacer, searchValue, « O, replaceValue »).
+                return replacer.call(search_value, &[o.into(), replace_value.clone()], context);
+            }
+        }
+
+        // 3. Let string be ? ToString(O).
+        let string = o.to_string(context)?;
+
+        // 4. Let searchString be ? ToString(searchValue).
+        let search_string = search_value.to_string(context)?;
+
+        // 5. Let functionalReplace be IsCallable(replaceValue).
+        let functional_replace = replace_value.is_function();
+
+        // 6. If functionalReplace is false, then
+        let replace_value_string = if !functional_replace {
+            // a. Set replaceValue to ? ToString(replaceValue).
+            replace_value.to_string(context)?
+        } else {
+            JsString::new("")
+        };
+
+        // 7. Let searchLength be the length of searchString.
+        let search_length = search_string.encode_utf16().count();
+
+        // 8. Let advanceBy be max(1, searchLength).
+        let advance_by = max(1, search_length);
+
+        // 9. Let matchPositions be a new empty List.
+        let mut match_positions = Vec::new();
+
+        // 10. Let position be ! StringIndexOf(string, searchString, 0).
+        let mut position = string.index_of(&search_string, 0);
+
+        // 11. Repeat, while position is not -1,
+        while let Some(p) = position {
+            // a. Append position to the end of matchPositions.
+            match_positions.push(p);
+
+            // b. Set position to ! StringIndexOf(string, searchString, position + advanceBy).
+            position = string.index_of(&search_string, p + advance_by);
+        }
+
+        // 12. Let endOfLastMatch be 0.
+        let mut end_of_last_match = 0;
+
+        // 13. Let result be the empty String.
+        let mut result = JsString::new("");
+
+        // 14. For each element p of matchPositions, do
+        for p in match_positions {
+            // a. Let preserved be the substring of string from endOfLastMatch to p.
+            let preserved = StdString::from_utf16_lossy(
+                &string
+                    .clone()
+                    .encode_utf16()
+                    .skip(end_of_last_match)
+                    .take(p - end_of_last_match)
+                    .collect::<Vec<u16>>(),
+            );
+
+            // b. If functionalReplace is true, then
+            // c. Else,
+            let replacement = if functional_replace {
+                // i. Let replacement be ? ToString(? Call(replaceValue, undefined, « searchString, 𝔽(p), string »)).
+                context
+                    .call(
+                        replace_value,
+                        &JsValue::undefined(),
+                        &[
+                            search_string.clone().into(),
+                            p.into(),
+                            string.clone().into(),
+                        ],
+                    )?
+                    .to_string(context)?
+            } else {
+                // i. Assert: Type(replaceValue) is String.
+                // ii. Let captures be a new empty List.
+                // iii. Let replacement be ! GetSubstitution(searchString, string, p, captures, undefined, replaceValue).
+                get_substitution(
+                    search_string.to_string(),
+                    string.to_string(),
+                    p,
+                    Vec::new(),
+                    JsValue::undefined(),
+                    replace_value_string.clone(),
+                    context,
+                )
+                .expect("GetSubstitution should never fail here.")
+            };
+            // d. Set result to the string-concatenation of result, preserved, and replacement.
+            result = JsString::new(format!("{}{}{}", result.as_str(), &preserved, &replacement));
+
+            // e. Set endOfLastMatch to p + searchLength.
+            end_of_last_match = p + search_length;
+        }
+
+        // 15. If endOfLastMatch < the length of string, then
+        if end_of_last_match < string.encode_utf16().count() {
+            // a. Set result to the string-concatenation of result and the substring of string from endOfLastMatch.
+            result = JsString::new(format!(
+                "{}{}",
+                result.as_str(),
+                &StdString::from_utf16_lossy(
+                    &string
+                        .encode_utf16()
+                        .skip(end_of_last_match)
+                        .collect::<Vec<u16>>()
+                )
+            ));
+        }
+
+        // 16. Return result.
+        Ok(result.into())
     }
 
     /// `String.prototype.indexOf( searchValue[, fromIndex] )`
@@ -807,14 +999,18 @@ impl String {
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.indexof
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/indexOf
-    pub(crate) fn index_of(this: &Value, args: &[Value], context: &mut Context) -> Result<Value> {
+    pub(crate) fn index_of(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
         let this = this.require_object_coercible(context)?;
         let string = this.to_string(context)?;
 
         let search_string = args
             .get(0)
             .cloned()
-            .unwrap_or_else(Value::undefined)
+            .unwrap_or_else(JsValue::undefined)
             .to_string(context)?;
 
         let length = string.chars().count();
@@ -834,7 +1030,7 @@ impl String {
             }
         }
 
-        Ok(Value::from(-1))
+        Ok(JsValue::new(-1))
     }
 
     /// `String.prototype.lastIndexOf( searchValue[, fromIndex] )`
@@ -851,17 +1047,17 @@ impl String {
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.lastindexof
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/lastIndexOf
     pub(crate) fn last_index_of(
-        this: &Value,
-        args: &[Value],
+        this: &JsValue,
+        args: &[JsValue],
         context: &mut Context,
-    ) -> Result<Value> {
+    ) -> JsResult<JsValue> {
         let this = this.require_object_coercible(context)?;
         let string = this.to_string(context)?;
 
         let search_string = args
             .get(0)
             .cloned()
-            .unwrap_or_else(Value::undefined)
+            .unwrap_or_else(JsValue::undefined)
             .to_string(context)?;
 
         let length = string.chars().count();
@@ -881,7 +1077,7 @@ impl String {
             }
         }
 
-        Ok(Value::from(-1))
+        Ok(JsValue::new(-1))
     }
 
     /// `String.prototype.match( regexp )`
@@ -895,13 +1091,40 @@ impl String {
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.match
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/match
     /// [regex]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Regular_Expressions
-    pub(crate) fn r#match(this: &Value, args: &[Value], context: &mut Context) -> Result<Value> {
-        let re = RegExp::constructor(
-            &Value::from(Object::default()),
-            &[args.get(0).cloned().unwrap_or_default()],
-            context,
-        )?;
-        RegExp::r#match(&re, this.to_string(context)?, context)
+    pub(crate) fn r#match(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
+        // 1. Let O be ? RequireObjectCoercible(this value).
+        let o = this.require_object_coercible(context)?;
+
+        // 2. If regexp is neither undefined nor null, then
+        let regexp = args.get_or_undefined(0);
+        if !regexp.is_null_or_undefined() {
+            // a. Let matcher be ? GetMethod(regexp, @@match).
+            // b. If matcher is not undefined, then
+            if let Some(obj) = regexp.as_object() {
+                if let Some(matcher) = obj.get_method(context, WellKnownSymbols::match_())? {
+                    // i. Return ? Call(matcher, regexp, « O »).
+                    return matcher.call(regexp, &[o.clone()], context);
+                }
+            }
+        }
+
+        // 3. Let S be ? ToString(O).
+        let s = o.to_string(context)?;
+
+        // 4. Let rx be ? RegExpCreate(regexp, undefined).
+        let rx = RegExp::create(regexp.clone(), JsValue::undefined(), context)?;
+
+        // 5. Return ? Invoke(rx, @@match, « S »).
+        let obj = rx.as_object().expect("RegExpCreate must return Object");
+        if let Some(matcher) = obj.get_method(context, WellKnownSymbols::match_())? {
+            matcher.call(&rx, &[JsValue::new(s)], context)
+        } else {
+            context.throw_type_error("RegExp[Symbol.match] is undefined")
+        }
     }
 
     /// Abstract method `StringPad`.
@@ -909,21 +1132,21 @@ impl String {
     /// Performs the actual string padding for padStart/End.
     /// <https://tc39.es/ecma262/#sec-stringpad/>
     fn string_pad(
-        primitive: RcString,
+        primitive: JsString,
         max_length: i32,
-        fill_string: Option<RcString>,
+        fill_string: Option<JsString>,
         at_start: bool,
-    ) -> Value {
+    ) -> JsValue {
         let primitive_length = primitive.len() as i32;
 
         if max_length <= primitive_length {
-            return Value::from(primitive);
+            return JsValue::new(primitive);
         }
 
         let filler = fill_string.as_deref().unwrap_or(" ");
 
         if filler.is_empty() {
-            return Value::from(primitive);
+            return JsValue::new(primitive);
         }
 
         let fill_len = max_length.wrapping_sub(primitive_length);
@@ -936,9 +1159,9 @@ impl String {
         let concat_fill_str: StdString = fill_str.chars().take(fill_len as usize).collect();
 
         if at_start {
-            Value::from(format!("{}{}", concat_fill_str, &primitive))
+            JsValue::new(format!("{}{}", concat_fill_str, &primitive))
         } else {
-            Value::from(format!("{}{}", primitive, &concat_fill_str))
+            JsValue::new(format!("{}{}", primitive, &concat_fill_str))
         }
     }
 
@@ -954,10 +1177,14 @@ impl String {
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.padend
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/padEnd
-    pub(crate) fn pad_end(this: &Value, args: &[Value], context: &mut Context) -> Result<Value> {
+    pub(crate) fn pad_end(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
         let primitive = this.to_string(context)?;
         if args.is_empty() {
-            return Err(Value::from("padEnd requires maxLength argument"));
+            return Err(JsValue::new("padEnd requires maxLength argument"));
         }
         let max_length = args
             .get(0)
@@ -981,10 +1208,14 @@ impl String {
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.padstart
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/padStart
-    pub(crate) fn pad_start(this: &Value, args: &[Value], context: &mut Context) -> Result<Value> {
+    pub(crate) fn pad_start(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
         let primitive = this.to_string(context)?;
         if args.is_empty() {
-            return Err(Value::from("padStart requires maxLength argument"));
+            return Err(JsValue::new("padStart requires maxLength argument"));
         }
         let max_length = args
             .get(0)
@@ -1008,10 +1239,10 @@ impl String {
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.trim
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/trim
-    pub(crate) fn trim(this: &Value, _: &[Value], context: &mut Context) -> Result<Value> {
+    pub(crate) fn trim(this: &JsValue, _: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
         let this = this.require_object_coercible(context)?;
         let string = this.to_string(context)?;
-        Ok(Value::from(string.trim_matches(is_trimmable_whitespace)))
+        Ok(JsValue::new(string.trim_matches(is_trimmable_whitespace)))
     }
 
     /// `String.prototype.trimStart()`
@@ -1026,9 +1257,13 @@ impl String {
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.trimstart
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/trimStart
-    pub(crate) fn trim_start(this: &Value, _: &[Value], context: &mut Context) -> Result<Value> {
+    pub(crate) fn trim_start(
+        this: &JsValue,
+        _: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
         let string = this.to_string(context)?;
-        Ok(Value::from(
+        Ok(JsValue::new(
             string.trim_start_matches(is_trimmable_whitespace),
         ))
     }
@@ -1045,10 +1280,14 @@ impl String {
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.trimend
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/trimEnd
-    pub(crate) fn trim_end(this: &Value, _: &[Value], context: &mut Context) -> Result<Value> {
+    pub(crate) fn trim_end(
+        this: &JsValue,
+        _: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
         let this = this.require_object_coercible(context)?;
         let string = this.to_string(context)?;
-        Ok(Value::from(
+        Ok(JsValue::new(
             string.trim_end_matches(is_trimmable_whitespace),
         ))
     }
@@ -1064,13 +1303,17 @@ impl String {
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.tolowercase
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/toLowerCase
     #[allow(clippy::wrong_self_convention)]
-    pub(crate) fn to_lowercase(this: &Value, _: &[Value], context: &mut Context) -> Result<Value> {
+    pub(crate) fn to_lowercase(
+        this: &JsValue,
+        _: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
         // First we get it the actual string a private field stored on the object only the context has access to.
         // Then we convert it into a Rust String by wrapping it in from_value
         let this_str = this.to_string(context)?;
         // The Rust String is mapped to uppercase using the builtin .to_lowercase().
         // There might be corner cases where it does not behave exactly like Javascript expects
-        Ok(Value::from(this_str.to_lowercase()))
+        Ok(JsValue::new(this_str.to_lowercase()))
     }
 
     /// `String.prototype.toUpperCase()`
@@ -1086,13 +1329,17 @@ impl String {
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.toUppercase
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/toUpperCase
     #[allow(clippy::wrong_self_convention)]
-    pub(crate) fn to_uppercase(this: &Value, _: &[Value], context: &mut Context) -> Result<Value> {
+    pub(crate) fn to_uppercase(
+        this: &JsValue,
+        _: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
         // First we get it the actual string a private field stored on the object only the context has access to.
         // Then we convert it into a Rust String by wrapping it in from_value
         let this_str = this.to_string(context)?;
         // The Rust String is mapped to uppercase using the builtin .to_uppercase().
         // There might be corner cases where it does not behave exactly like Javascript expects
-        Ok(Value::from(this_str.to_uppercase()))
+        Ok(JsValue::new(this_str.to_uppercase()))
     }
 
     /// `String.prototype.substring( indexStart[, indexEnd] )`
@@ -1105,26 +1352,26 @@ impl String {
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.substring
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/substring
-    pub(crate) fn substring(this: &Value, args: &[Value], context: &mut Context) -> Result<Value> {
+    pub(crate) fn substring(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
         // First we get it the actual string a private field stored on the object only the context has access to.
         // Then we convert it into a Rust String by wrapping it in from_value
         let primitive_val = this.to_string(context)?;
         // If no args are specified, start is 'undefined', defaults to 0
-        let start = if args.is_empty() {
-            0
+        let start = if let Some(integer) = args.get(0) {
+            integer.to_integer(context)? as i32
         } else {
-            args.get(0)
-                .expect("failed to get argument for String method")
-                .to_integer(context)? as i32
+            0
         };
         let length = primitive_val.encode_utf16().count() as i32;
         // If less than 2 args specified, end is the length of the this object converted to a String
-        let end = if args.len() < 2 {
-            length
+        let end = if let Some(integer) = args.get(1) {
+            integer.to_integer(context)? as i32
         } else {
-            args.get(1)
-                .expect("Could not get argument")
-                .to_integer(context)? as i32
+            length
         };
         // Both start and end args replaced by 0 if they were negative
         // or by the length of the String if they were greater
@@ -1135,14 +1382,14 @@ impl String {
         let to = max(final_start, final_end) as usize;
         // Extract the part of the string contained between the start index and the end index
         // where start is guaranteed to be smaller or equals to end
-        let extracted_string: std::result::Result<StdString, _> = decode_utf16(
+        let extracted_string: Result<StdString, _> = decode_utf16(
             primitive_val
                 .encode_utf16()
                 .skip(from)
                 .take(to.wrapping_sub(from)),
         )
         .collect();
-        Ok(Value::from(extracted_string.expect("Invalid string")))
+        Ok(JsValue::new(extracted_string.expect("Invalid string")))
     }
 
     /// `String.prototype.substr( start[, length] )`
@@ -1156,29 +1403,29 @@ impl String {
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.substr
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/substr
     /// <https://tc39.es/ecma262/#sec-string.prototype.substr>
-    pub(crate) fn substr(this: &Value, args: &[Value], context: &mut Context) -> Result<Value> {
+    pub(crate) fn substr(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
         // First we get it the actual string a private field stored on the object only the context has access to.
         // Then we convert it into a Rust String by wrapping it in from_value
         let primitive_val = this.to_string(context)?;
         // If no args are specified, start is 'undefined', defaults to 0
-        let mut start = if args.is_empty() {
-            0
+        let mut start = if let Some(integer) = args.get(0) {
+            integer.to_integer(context)? as i32
         } else {
-            args.get(0)
-                .expect("failed to get argument for String method")
-                .to_integer(context)? as i32
+            0
         };
         let length = primitive_val.chars().count() as i32;
         // If less than 2 args specified, end is +infinity, the maximum number value.
         // Using i32::max_value() should be safe because the final length used is at most
         // the number of code units from start to the end of the string,
         // which should always be smaller or equals to both +infinity and i32::max_value
-        let end = if args.len() < 2 {
-            i32::MAX
+        let end = if let Some(integer) = args.get(1) {
+            integer.to_integer(context)? as i32
         } else {
-            args.get(1)
-                .expect("Could not get argument")
-                .to_integer(context)? as i32
+            i32::MAX
         };
         // If start is negative it become the number of code units from the end of the string
         if start < 0 {
@@ -1190,7 +1437,7 @@ impl String {
         // If length is negative we return an empty string
         // otherwise we extract the part of the string from start and is length code units long
         if result_length <= 0 {
-            Ok(Value::from(""))
+            Ok(JsValue::new(""))
         } else {
             let extracted_string: StdString = primitive_val
                 .chars()
@@ -1198,14 +1445,13 @@ impl String {
                 .take(result_length as usize)
                 .collect();
 
-            Ok(Value::from(extracted_string))
+            Ok(JsValue::new(extracted_string))
         }
     }
 
-    /// String.prototype.split()
+    /// `String.prototype.split ( separator, limit )`
     ///
-    /// The `split()` method divides a String into an ordered list of substrings, puts these substrings into an array, and returns the array.
-    ///
+    /// The split() method divides a String into an ordered list of substrings, puts these substrings into an array, and returns the array.
     /// The division is done by searching for a pattern; where the pattern is provided as the first parameter in the method's call.
     ///
     /// More information:
@@ -1214,64 +1460,148 @@ impl String {
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.split
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/split
-    pub(crate) fn split(this: &Value, args: &[Value], context: &mut Context) -> Result<Value> {
+    pub(crate) fn split(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
+        // 1. Let O be ? RequireObjectCoercible(this value).
         let this = this.require_object_coercible(context)?;
-        let string = this.to_string(context)?;
 
-        let separator = args.get(0).filter(|value| !value.is_null_or_undefined());
+        let separator = args.get_or_undefined(0);
+        let limit = args.get_or_undefined(1);
 
-        if let Some(result) = separator
-            .and_then(|separator| separator.as_object())
-            .and_then(|separator| {
-                let key = WellKnownSymbols::split();
-
-                match separator.get_method(context, key) {
-                    Ok(splitter) => splitter.map(|splitter| {
-                        let arguments = &[
-                            Value::from(string.clone()),
-                            args.get(1)
-                                .map(|x| x.to_owned())
-                                .unwrap_or(Value::Undefined),
-                        ];
-                        splitter.call(this, arguments, context)
-                    }),
-                    Err(_) => Some(Err(
-                        context.construct_type_error("separator[Symbol.split] is not a function")
-                    )),
-                }
-            })
-        {
-            return result;
+        // 2. If separator is neither undefined nor null, then
+        if !separator.is_null_or_undefined() {
+            // a. Let splitter be ? GetMethod(separator, @@split).
+            // b. If splitter is not undefined, then
+            if let Some(splitter) = separator
+                .as_object()
+                .unwrap_or_default()
+                .get_method(context, WellKnownSymbols::split())?
+            {
+                // i. Return ? Call(splitter, separator, « O, limit »).
+                return splitter.call(separator, &[this.clone(), limit.clone()], context);
+            }
         }
 
-        let separator = separator
-            .map(|separator| separator.to_string(context))
-            .transpose()?;
+        // 3. Let S be ? ToString(O).
+        let this_str = this.to_string(context)?;
 
-        let limit = args
-            .get(1)
-            .map(|arg| arg.to_integer(context).map(|limit| limit as usize))
-            .transpose()?
-            .unwrap_or(u32::MAX as usize);
+        // 4. Let A be ! ArrayCreate(0).
+        let a = Array::array_create(0, None, context)?;
 
-        let values: Vec<Value> = match separator {
-            None if limit == 0 => vec![],
-            None => vec![Value::from(string)],
-            Some(separator) if separator.is_empty() => string
-                .encode_utf16()
-                // TODO: Support keeping invalid code point in string
-                .map(|cp| Value::from(std::string::String::from_utf16_lossy(&[cp])))
-                .take(limit)
-                .collect(),
-            Some(separator) => string
-                .split(separator.as_str())
-                .map(&Value::from)
-                .take(limit)
-                .collect(),
+        // 5. Let lengthA be 0.
+        let mut length_a = 0;
+
+        // 6.  If limit is undefined, let lim be 2^32 - 1; else let lim be ℝ(? ToUint32(limit)).
+        let lim = if limit.is_undefined() {
+            u32::MAX
+        } else {
+            limit.to_u32(context)?
         };
 
-        let new = Array::new_array(context);
-        Array::construct_array(&new, &values, context)
+        // 7. Let R be ? ToString(separator).
+        let separator_str = separator.to_string(context)?;
+
+        // 8. If lim = 0, return A.
+        if lim == 0 {
+            return Ok(a.into());
+        }
+
+        // 9. If separator is undefined, then
+        if separator.is_undefined() {
+            // a. Perform ! CreateDataPropertyOrThrow(A, "0", S).
+            a.create_data_property_or_throw(0, this_str, context)
+                .unwrap();
+
+            // b. Return A.
+            return Ok(a.into());
+        }
+
+        // 10. Let s be the length of S.
+        let this_str_length = this_str.encode_utf16().count();
+
+        // 11. If s = 0, then
+        if this_str_length == 0 {
+            // a. If R is not the empty String, then
+            if !separator_str.is_empty() {
+                // i. Perform ! CreateDataPropertyOrThrow(A, "0", S).
+                a.create_data_property_or_throw(0, this_str, context)
+                    .unwrap();
+            }
+
+            // b. Return A.
+            return Ok(a.into());
+        }
+
+        // 12. Let p be 0.
+        // 13. Let q be p.
+        let mut p = 0;
+        let mut q = p;
+
+        // 14. Repeat, while q ≠ s,
+        while q != this_str_length {
+            // a. Let e be SplitMatch(S, q, R).
+            let e = split_match(&this_str, q, &separator_str);
+
+            match e {
+                // b. If e is not-matched, set q to q + 1.
+                None => q += 1,
+                // c. Else,
+                Some(e) => {
+                    // i. Assert: e is a non-negative integer ≤ s.
+                    // ii. If e = p, set q to q + 1.
+                    // iii. Else,
+                    if e == p {
+                        q += 1;
+                    } else {
+                        // 1. Let T be the substring of S from p to q.
+                        let this_str_substring = StdString::from_utf16_lossy(
+                            &this_str
+                                .encode_utf16()
+                                .skip(p)
+                                .take(q - p)
+                                .collect::<Vec<u16>>(),
+                        );
+
+                        // 2. Perform ! CreateDataPropertyOrThrow(A, ! ToString(𝔽(lengthA)), T).
+                        a.create_data_property_or_throw(length_a, this_str_substring, context)
+                            .unwrap();
+
+                        // 3. Set lengthA to lengthA + 1.
+                        length_a += 1;
+
+                        // 4. If lengthA = lim, return A.
+                        if length_a == lim {
+                            return Ok(a.into());
+                        }
+
+                        // 5. Set p to e.
+                        p = e;
+
+                        // 6. Set q to p.
+                        q = p;
+                    }
+                }
+            }
+        }
+
+        // 15. Let T be the substring of S from p to s.
+        let this_str_substring = StdString::from_utf16_lossy(
+            &this_str
+                .encode_utf16()
+                .skip(p)
+                .take(this_str_length - p)
+                .collect::<Vec<u16>>(),
+        );
+
+        // 16. Perform ! CreateDataPropertyOrThrow(A, ! ToString(𝔽(lengthA)), T).
+        a.create_data_property_or_throw(length_a, this_str_substring, context)
+            .unwrap();
+
+        // 17. Return A.
+        Ok(a.into())
     }
 
     /// String.prototype.valueOf()
@@ -1284,7 +1614,11 @@ impl String {
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.value_of
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/valueOf
-    pub(crate) fn value_of(this: &Value, args: &[Value], context: &mut Context) -> Result<Value> {
+    pub(crate) fn value_of(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
         // Use the to_string method because it is specified to do the same thing in this case
         Self::to_string(this, args, context)
     }
@@ -1301,34 +1635,57 @@ impl String {
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/matchAll
     /// [regex]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Regular_Expressions
     /// [cg]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Regular_Expressions/Groups_and_Ranges
-    // TODO: update this method to return iterator
-    pub(crate) fn match_all(this: &Value, args: &[Value], context: &mut Context) -> Result<Value> {
-        let re: Value = match args.get(0) {
-            Some(arg) => {
-                if arg.is_null() {
-                    RegExp::constructor(
-                        &Value::from(Object::default()),
-                        &[Value::from(arg.to_string(context)?), Value::from("g")],
-                        context,
-                    )
-                } else if arg.is_undefined() {
-                    RegExp::constructor(
-                        &Value::from(Object::default()),
-                        &[Value::undefined(), Value::from("g")],
-                        context,
-                    )
-                } else {
-                    Ok(arg.clone())
+    pub(crate) fn match_all(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
+        // 1. Let O be ? RequireObjectCoercible(this value).
+        let o = this.require_object_coercible(context)?;
+
+        // 2. If regexp is neither undefined nor null, then
+        let regexp = args.get_or_undefined(0);
+        if !regexp.is_null_or_undefined() {
+            // a. Let isRegExp be ? IsRegExp(regexp).
+            // b. If isRegExp is true, then
+            if regexp.as_object().unwrap_or_default().is_regexp() {
+                // i. Let flags be ? Get(regexp, "flags").
+                let flags = regexp.get_field("flags", context)?;
+
+                // ii. Perform ? RequireObjectCoercible(flags).
+                flags.require_object_coercible(context)?;
+
+                // iii. If ? ToString(flags) does not contain "g", throw a TypeError exception.
+                if !flags.to_string(context)?.contains('g') {
+                    return context.throw_type_error(
+                        "String.prototype.matchAll called with a non-global RegExp argument",
+                    );
                 }
             }
-            None => RegExp::constructor(
-                &Value::from(Object::default()),
-                &[Value::from(""), Value::from("g")],
-                context,
-            ),
-        }?;
 
-        RegExp::match_all(&re, this.to_string(context)?.to_string(), context)
+            // c. Let matcher be ? GetMethod(regexp, @@matchAll).
+            // d. If matcher is not undefined, then
+            if let Some(obj) = regexp.as_object() {
+                if let Some(matcher) = obj.get_method(context, WellKnownSymbols::match_all())? {
+                    // i. Return ? Call(matcher, regexp, « O »).
+                    return matcher.call(regexp, &[o.clone()], context);
+                }
+            }
+        }
+
+        // 3. Let S be ? ToString(O).
+        let s = o.to_string(context)?;
+
+        // 4. Let rx be ? RegExpCreate(regexp, "g").
+        let rx = RegExp::create(regexp.clone(), JsValue::new("g"), context)?;
+
+        // 5. Return ? Invoke(rx, @@matchAll, « S »).
+        let obj = rx.as_object().expect("RegExpCreate must return Object");
+        if let Some(matcher) = obj.get_method(context, WellKnownSymbols::match_all())? {
+            matcher.call(&rx, &[JsValue::new(s)], context)
+        } else {
+            context.throw_type_error("RegExp[Symbol.matchAll] is undefined")
+        }
     }
 
     /// `String.prototype.normalize( [ form ] )`
@@ -1341,10 +1698,14 @@ impl String {
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.normalize
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/normalize
-    pub(crate) fn normalize(this: &Value, args: &[Value], context: &mut Context) -> Result<Value> {
+    pub(crate) fn normalize(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
         let this = this.require_object_coercible(context)?;
         let s = this.to_string(context)?;
-        let form = args.get(0).cloned().unwrap_or_default();
+        let form = args.get_or_undefined(0);
 
         let f_str;
 
@@ -1356,10 +1717,10 @@ impl String {
         };
 
         match f {
-            "NFC" => Ok(Value::from(s.nfc().collect::<StdString>())),
-            "NFD" => Ok(Value::from(s.nfd().collect::<StdString>())),
-            "NFKC" => Ok(Value::from(s.nfkc().collect::<StdString>())),
-            "NFKD" => Ok(Value::from(s.nfkd().collect::<StdString>())),
+            "NFC" => Ok(JsValue::new(s.nfc().collect::<StdString>())),
+            "NFD" => Ok(JsValue::new(s.nfd().collect::<StdString>())),
+            "NFKC" => Ok(JsValue::new(s.nfkc().collect::<StdString>())),
+            "NFKD" => Ok(JsValue::new(s.nfkd().collect::<StdString>())),
             _ => context
                 .throw_range_error("The normalization form should be one of NFC, NFD, NFKC, NFKD."),
         }
@@ -1375,42 +1736,255 @@ impl String {
     ///
     /// [spec]: https://tc39.es/ecma262/#sec-string.prototype.search
     /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/search
-    pub(crate) fn search(this: &Value, args: &[Value], context: &mut Context) -> Result<Value> {
+    pub(crate) fn search(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
         // 1. Let O be ? RequireObjectCoercible(this value).
-        let this = this.require_object_coercible(context)?;
+        let o = this.require_object_coercible(context)?;
 
         // 2. If regexp is neither undefined nor null, then
-        let regexp = args.get(0).cloned().unwrap_or_default();
+        let regexp = args.get_or_undefined(0);
         if !regexp.is_null_or_undefined() {
             // a. Let searcher be ? GetMethod(regexp, @@search).
             // b. If searcher is not undefined, then
-            if let Some(searcher) = regexp
-                .to_object(context)?
-                .get_method(context, WellKnownSymbols::search())?
-            {
-                // i. Return ? Call(searcher, regexp, « O »).
-                return searcher.call(&regexp, &[this.clone()], context);
+            if let Some(obj) = regexp.as_object() {
+                if let Some(searcher) = obj.get_method(context, WellKnownSymbols::search())? {
+                    // i. Return ? Call(searcher, regexp, « O »).
+                    return searcher.call(regexp, &[o.clone()], context);
+                }
             }
         }
 
         // 3. Let string be ? ToString(O).
-        let s = this.to_string(context)?;
+        let string = o.to_string(context)?;
 
         // 4. Let rx be ? RegExpCreate(regexp, undefined).
-        let rx = RegExp::constructor(&Value::from(Object::default()), &[regexp], context)?;
+        let rx = RegExp::create(regexp.clone(), JsValue::undefined(), context)?;
 
         // 5. Return ? Invoke(rx, @@search, « string »).
-        if let Some(searcher) = rx
-            .to_object(context)?
-            .get_method(context, WellKnownSymbols::search())?
-        {
-            searcher.call(&rx, &[Value::from(s)], context)
+        let obj = rx.as_object().expect("RegExpCreate must return Object");
+        if let Some(matcher) = obj.get_method(context, WellKnownSymbols::search())? {
+            matcher.call(&rx, &[JsValue::new(string)], context)
         } else {
-            context.throw_type_error("regexp[Symbol.search] is not a function")
+            context.throw_type_error("RegExp[Symbol.search] is undefined")
         }
     }
 
-    pub(crate) fn iterator(this: &Value, _: &[Value], context: &mut Context) -> Result<Value> {
-        StringIterator::create_string_iterator(context, this.clone())
+    pub(crate) fn iterator(
+        this: &JsValue,
+        _: &[JsValue],
+        context: &mut Context,
+    ) -> JsResult<JsValue> {
+        StringIterator::create_string_iterator(this.clone(), context)
     }
+}
+
+/// `22.1.3.17.1 GetSubstitution ( matched, str, position, captures, namedCaptures, replacement )`
+///
+/// More information:
+///  - [ECMAScript reference][spec]
+///
+/// [spec]: https://tc39.es/ecma262/#sec-getsubstitution
+pub(crate) fn get_substitution(
+    matched: StdString,
+    str: StdString,
+    position: usize,
+    captures: Vec<JsValue>,
+    named_captures: JsValue,
+    replacement: JsString,
+    context: &mut Context,
+) -> JsResult<JsString> {
+    // 1. Assert: Type(matched) is String.
+
+    // 2. Let matchLength be the number of code units in matched.
+    let match_length = matched.encode_utf16().count();
+
+    // 3. Assert: Type(str) is String.
+
+    // 4. Let stringLength be the number of code units in str.
+    let str_length = str.encode_utf16().count();
+
+    // 5. Assert: position ≤ stringLength.
+    // 6. Assert: captures is a possibly empty List of Strings.
+    // 7. Assert: Type(replacement) is String.
+
+    // 8. Let tailPos be position + matchLength.
+    let tail_pos = position + match_length;
+
+    // 9. Let m be the number of elements in captures.
+    let m = captures.len();
+
+    // 10. Let result be the String value derived from replacement by copying code unit elements
+    //     from replacement to result while performing replacements as specified in Table 58.
+    //     These $ replacements are done left-to-right, and, once such a replacement is performed,
+    //     the new replacement text is not subject to further replacements.
+    let mut result = StdString::new();
+    let mut chars = replacement.chars().peekable();
+
+    while let Some(first) = chars.next() {
+        if first == '$' {
+            let second = chars.next();
+            let second_is_digit = second.map_or(false, |ch| ch.is_digit(10));
+            // we use peek so that it is still in the iterator if not used
+            let third = if second_is_digit { chars.peek() } else { None };
+            let third_is_digit = third.map_or(false, |ch| ch.is_digit(10));
+
+            match (second, third) {
+                // $$
+                (Some('$'), _) => {
+                    // $
+                    result.push('$');
+                }
+                // $&
+                (Some('&'), _) => {
+                    // matched
+                    result.push_str(&matched);
+                }
+                // $`
+                (Some('`'), _) => {
+                    // The replacement is the substring of str from 0 to position.
+                    result.push_str(&StdString::from_utf16_lossy(
+                        &str.encode_utf16().take(position).collect::<Vec<u16>>(),
+                    ));
+                }
+                // $'
+                (Some('\''), _) => {
+                    // If tailPos ≥ stringLength, the replacement is the empty String.
+                    // Otherwise the replacement is the substring of str from tailPos.
+                    if tail_pos < str_length {
+                        result.push_str(&StdString::from_utf16_lossy(
+                            &str.encode_utf16().skip(tail_pos).collect::<Vec<u16>>(),
+                        ));
+                    }
+                }
+                // $nn
+                (Some(second), Some(third)) if second_is_digit && third_is_digit => {
+                    // The nnth element of captures, where nn is a two-digit decimal number in the range 01 to 99.
+                    let tens = second.to_digit(10).unwrap() as usize;
+                    let units = third.to_digit(10).unwrap() as usize;
+                    let nn = 10 * tens + units;
+
+                    // If nn ≤ m and the nnth element of captures is undefined, use the empty String instead.
+                    // If nn is 00 or nn > m, no replacement is done.
+                    if nn == 0 || nn > m {
+                        result.push('$');
+                        result.push(second);
+                        result.push(*third);
+                    } else if let Some(capture) = captures.get(nn - 1) {
+                        if let Some(s) = capture.as_string() {
+                            result.push_str(s);
+                        }
+                    }
+
+                    chars.next();
+                }
+                // $n
+                (Some(second), _) if second_is_digit => {
+                    // The nth element of captures, where n is a single digit in the range 1 to 9.
+                    let n = second.to_digit(10).unwrap() as usize;
+
+                    // If n ≤ m and the nth element of captures is undefined, use the empty String instead.
+                    // If n > m, no replacement is done.
+                    if n == 0 || n > m {
+                        result.push('$');
+                        result.push(second);
+                    } else if let Some(capture) = captures.get(n - 1) {
+                        if let Some(s) = capture.as_string() {
+                            result.push_str(s);
+                        }
+                    }
+                }
+                // $<
+                (Some('<'), _) => {
+                    // 1. If namedCaptures is undefined, the replacement text is the String "$<".
+                    // 2. Else,
+                    if named_captures.is_undefined() {
+                        result.push_str("$<")
+                    } else {
+                        // a. Assert: Type(namedCaptures) is Object.
+
+                        // b. Scan until the next > U+003E (GREATER-THAN SIGN).
+                        let mut group_name = StdString::new();
+                        let mut found = false;
+                        loop {
+                            match chars.next() {
+                                Some('>') => {
+                                    found = true;
+                                    break;
+                                }
+                                Some(c) => group_name.push(c),
+                                None => break,
+                            }
+                        }
+
+                        // c. If none is found, the replacement text is the String "$<".
+                        // d. Else,
+                        if !found {
+                            result.push_str("$<");
+                            result.push_str(&group_name);
+                        } else {
+                            // i. Let groupName be the enclosed substring.
+                            // ii. Let capture be ? Get(namedCaptures, groupName).
+                            let capture = named_captures.get_field(group_name, context)?;
+
+                            // iii. If capture is undefined, replace the text through > with the empty String.
+                            // iv. Otherwise, replace the text through > with ? ToString(capture).
+                            if !capture.is_undefined() {
+                                result.push_str(capture.to_string(context)?.as_str());
+                            }
+                        }
+                    }
+                }
+                // $?, ? is none of the above
+                _ => {
+                    result.push('$');
+                    if let Some(second) = second {
+                        result.push(second);
+                    }
+                }
+            }
+        } else {
+            result.push(first);
+        }
+    }
+
+    // 11. Return result.
+    Ok(result.into())
+}
+
+/// `22.1.3.21.1 SplitMatch ( S, q, R )`
+///
+/// More information:
+///  - [ECMAScript reference][spec]
+///
+/// [spec]: https://tc39.es/ecma262/#sec-splitmatch
+fn split_match(s_str: &str, q: usize, r_str: &str) -> Option<usize> {
+    // 1. Let r be the number of code units in R.
+    let r = r_str.encode_utf16().count();
+
+    // 2. Let s be the number of code units in S.
+    let s = s_str.encode_utf16().count();
+
+    // 3. If q + r > s, return not-matched.
+    if q + r > s {
+        return None;
+    }
+
+    // 4. If there exists an integer i between 0 (inclusive) and r (exclusive)
+    //    such that the code unit at index q + i within S is different from the code unit at index i within R,
+    //    return not-matched.
+    for i in 0..r {
+        if let Some(s_char) = s_str.encode_utf16().nth(q + i) {
+            if let Some(r_char) = r_str.encode_utf16().nth(i) {
+                if s_char != r_char {
+                    return None;
+                }
+            }
+        }
+    }
+
+    // 5. Return q + r.
+    Some(q + r)
 }

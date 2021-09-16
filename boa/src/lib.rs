@@ -13,7 +13,6 @@ This is an experimental Javascript lexer, parser and compiler written in Rust. C
     html_favicon_url = "https://raw.githubusercontent.com/jasonwilliams/boa/master/assets/logo.svg"
 )]
 #![deny(
-    unused_qualifications,
     clippy::all,
     unused_qualifications,
     unused_import_braces,
@@ -42,8 +41,7 @@ This is an experimental Javascript lexer, parser and compiler written in Rust. C
     missing_doc_code_examples
 )]
 
-// builtins module has a lot of built-in functions that need unnecessary_wraps
-#[allow(clippy::unnecessary_wraps)]
+pub mod bigint;
 pub mod builtins;
 pub mod class;
 pub mod context;
@@ -54,9 +52,8 @@ pub mod object;
 pub mod profiler;
 pub mod property;
 pub mod realm;
+pub mod string;
 pub mod symbol;
-// syntax module has a lot of acronyms
-#[allow(clippy::upper_case_acronyms)]
 pub mod syntax;
 pub mod value;
 
@@ -65,13 +62,20 @@ pub mod bytecompiler;
 #[cfg(feature = "vm")]
 pub mod vm;
 
+/// A convenience module that re-exports the most commonly-used Boa APIs
+pub mod prelude {
+    pub use crate::{object::JsObject, Context, JsBigInt, JsResult, JsString, JsValue};
+}
+
 use std::result::Result as StdResult;
 
 pub(crate) use crate::{exec::Executable, profiler::BoaProfiler};
 
 // Export things to root level
 #[doc(inline)]
-pub use crate::{context::Context, value::Value};
+pub use crate::{
+    bigint::JsBigInt, context::Context, string::JsString, symbol::JsSymbol, value::JsValue,
+};
 
 use crate::syntax::{
     ast::node::StatementList,
@@ -80,7 +84,7 @@ use crate::syntax::{
 
 /// The result of a Javascript expression is represented like this so it can succeed (`Ok`) or fail (`Err`)
 #[must_use]
-pub type Result<T> = StdResult<T, Value>;
+pub type JsResult<T> = StdResult<T, JsValue>;
 
 /// Parses the given source code.
 ///
@@ -123,7 +127,7 @@ pub(crate) fn forward<T: AsRef<[u8]>>(context: &mut Context, src: T) -> String {
 /// If the interpreter fails parsing an error value is returned instead (error object)
 #[allow(clippy::unit_arg, clippy::drop_copy)]
 #[cfg(test)]
-pub(crate) fn forward_val<T: AsRef<[u8]>>(context: &mut Context, src: T) -> Result<Value> {
+pub(crate) fn forward_val<T: AsRef<[u8]>>(context: &mut Context, src: T) -> JsResult<JsValue> {
     let main_timer = BoaProfiler::global().start_event("Main", "Main");
 
     let src_bytes: &[u8] = src.as_ref();
@@ -151,5 +155,49 @@ pub(crate) fn exec<T: AsRef<[u8]>>(src: T) -> String {
     match Context::new().eval(src_bytes) {
         Ok(value) => value.display().to_string(),
         Err(error) => error.display().to_string(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) enum TestAction {
+    Execute(&'static str),
+    TestEq(&'static str, &'static str),
+    TestStartsWith(&'static str, &'static str),
+}
+
+/// Create a clean Context, call "forward" for each action, and optionally
+/// assert equality of the returned value or if returned value starts with
+/// expected string.
+#[cfg(test)]
+#[track_caller]
+pub(crate) fn check_output(actions: &[TestAction]) {
+    let mut context = Context::new();
+
+    let mut i = 1;
+    for action in actions {
+        match action {
+            TestAction::Execute(src) => {
+                forward(&mut context, src);
+            }
+            TestAction::TestEq(case, expected) => {
+                assert_eq!(
+                    &forward(&mut context, case),
+                    expected,
+                    "Test case {} ('{}')",
+                    i,
+                    case
+                );
+                i += 1;
+            }
+            TestAction::TestStartsWith(case, expected) => {
+                assert!(
+                    &forward(&mut context, case).starts_with(expected),
+                    "Test case {} ('{}')",
+                    i,
+                    case
+                );
+                i += 1;
+            }
+        }
     }
 }

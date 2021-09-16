@@ -28,10 +28,10 @@ fn check_basic() {
             Some(FunctionDecl::new(
                 Box::from("constructor"),
                 vec![],
-                vec![
-                    DeclarationList::Let(vec![Declaration::new("val", None)].into_boxed_slice())
-                        .into(),
-                ],
+                vec![DeclarationList::Let(
+                    vec![Declaration::new_with_identifier("val", None)].into_boxed_slice(),
+                )
+                .into()],
             )),
             vec![],
             vec![],
@@ -58,10 +58,10 @@ fn check_static() {
             vec![ClassField::Method(FunctionDecl::new(
                 Box::from("say_hello"),
                 vec![],
-                vec![
-                    DeclarationList::Let(vec![Declaration::new("val", None)].into_boxed_slice())
-                        .into(),
-                ],
+                vec![DeclarationList::Let(
+                    vec![Declaration::new_with_identifier("val", None)].into_boxed_slice(),
+                )
+                .into()],
             ))],
         )
         .into()],
@@ -86,10 +86,10 @@ fn check_multi() {
             Some(FunctionDecl::new(
                 Box::from("constructor"),
                 vec![],
-                vec![
-                    DeclarationList::Let(vec![Declaration::new("val", None)].into_boxed_slice())
-                        .into(),
-                ],
+                vec![DeclarationList::Let(
+                    vec![Declaration::new_with_identifier("val", None)].into_boxed_slice(),
+                )
+                .into()],
             )),
             vec![
                 ClassField::Method(FunctionDecl::new(Box::from("say_hello"), vec![], vec![])),

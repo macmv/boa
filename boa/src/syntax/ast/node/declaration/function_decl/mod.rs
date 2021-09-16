@@ -4,7 +4,7 @@ use crate::{
     exec::Executable,
     gc::{Finalize, Trace},
     syntax::ast::node::{join_nodes, FormalParameter, Node, StatementList},
-    BoaProfiler, Context, Result, Value,
+    BoaProfiler, Context, JsResult, JsValue,
 };
 use std::fmt;
 
@@ -63,8 +63,8 @@ impl FunctionDecl {
     }
 
     /// Gets the body of the function declaration.
-    pub fn body(&self) -> &[Node] {
-        self.body.items()
+    pub fn body(&self) -> &StatementList {
+        &self.body
     }
 
     /// Implements the display formatting with indentation.
@@ -85,7 +85,7 @@ impl FunctionDecl {
     ) -> fmt::Result {
         write!(f, "{}(", self.name)?;
         join_nodes(f, &self.parameters)?;
-        if self.body().is_empty() {
+        if self.body().items().is_empty() {
             f.write_str(") {}")
         } else {
             f.write_str(") {\n")?;
@@ -96,29 +96,23 @@ impl FunctionDecl {
 }
 
 impl Executable for FunctionDecl {
-    fn run(&self, context: &mut Context) -> Result<Value> {
+    fn run(&self, context: &mut Context) -> JsResult<JsValue> {
         let _timer = BoaProfiler::global().start_event("FunctionDecl", "exec");
         let val = context.create_function(
+            self.name(),
             self.parameters().to_vec(),
-            self.body().to_vec(),
-            FunctionFlags::CALLABLE | FunctionFlags::CONSTRUCTABLE,
+            self.body().clone(),
+            FunctionFlags::CONSTRUCTABLE,
         )?;
 
-        // Set the name and assign it in the current environment
-        val.set_field("name", self.name(), false, context)?;
-
-        if context.has_binding(self.name()) {
-            context.set_mutable_binding(self.name(), val, true)?;
+        if context.has_binding(self.name())? {
+            context.set_mutable_binding(self.name(), val, context.strict())?;
         } else {
-            context.create_mutable_binding(
-                self.name().to_owned(),
-                false,
-                VariableScope::Function,
-            )?;
+            context.create_mutable_binding(self.name(), false, VariableScope::Function)?;
 
             context.initialize_binding(self.name(), val)?;
         }
-        Ok(Value::undefined())
+        Ok(JsValue::undefined())
     }
 }
 

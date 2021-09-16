@@ -3,7 +3,7 @@ use crate::{
     exec::Executable,
     gc::{Finalize, Trace},
     syntax::ast::node::{join_nodes, FormalParameter, Node, StatementList},
-    Context, Result, Value,
+    Context, JsResult, JsValue,
 };
 use std::fmt;
 
@@ -60,8 +60,8 @@ impl FunctionExpr {
     }
 
     /// Gets the body of the function declaration.
-    pub fn body(&self) -> &[Node] {
-        self.body.items()
+    pub fn body(&self) -> &StatementList {
+        &self.body
     }
 
     /// Implements the display formatting with indentation.
@@ -87,7 +87,7 @@ impl FunctionExpr {
         f: &mut fmt::Formatter<'_>,
         indentation: usize,
     ) -> fmt::Result {
-        if self.body().is_empty() {
+        if self.body().items().is_empty() {
             f.write_str("{}")
         } else {
             f.write_str("{\n")?;
@@ -98,16 +98,13 @@ impl FunctionExpr {
 }
 
 impl Executable for FunctionExpr {
-    fn run(&self, context: &mut Context) -> Result<Value> {
+    fn run(&self, context: &mut Context) -> JsResult<JsValue> {
         let val = context.create_function(
+            self.name().unwrap_or(""),
             self.parameters().to_vec(),
-            self.body().to_vec(),
-            FunctionFlags::CALLABLE | FunctionFlags::CONSTRUCTABLE,
+            self.body().clone(),
+            FunctionFlags::CONSTRUCTABLE,
         )?;
-
-        if let Some(name) = self.name() {
-            val.set_field("name", Value::from(name), false, context)?;
-        }
 
         Ok(val)
     }

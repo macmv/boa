@@ -3,8 +3,8 @@ use crate::{
     exec::Executable,
     gc::{Finalize, Trace},
     syntax::ast::node::{Call, Node},
-    value::Value,
-    BoaProfiler, Context, Result,
+    value::JsValue,
+    BoaProfiler, Context, JsResult,
 };
 use std::fmt;
 
@@ -38,17 +38,17 @@ pub struct New {
 impl New {
     /// Gets the name of the function call.
     pub fn expr(&self) -> &Node {
-        &self.call.expr()
+        self.call.expr()
     }
 
     /// Retrieves the arguments passed to the function.
     pub fn args(&self) -> &[Node] {
-        &self.call.args()
+        self.call.args()
     }
 }
 
 impl Executable for New {
-    fn run(&self, context: &mut Context) -> Result<Value> {
+    fn run(&self, context: &mut Context) -> JsResult<JsValue> {
         let _timer = BoaProfiler::global().start_event("New", "exec");
 
         let func_object = self.expr().run(context)?;
@@ -56,14 +56,14 @@ impl Executable for New {
         for arg in self.args() {
             if let Node::Spread(ref x) = arg {
                 let val = x.run(context)?;
-                let iterator_record = iterable::get_iterator(context, val)?;
+                let iterator_record = iterable::get_iterator(&val, context)?;
                 loop {
                     let next = iterator_record.next(context)?;
-                    if next.is_done() {
+                    if next.done {
                         break;
                     }
-                    let next_value = next.value();
-                    v_args.push(next_value.clone());
+                    let next_value = next.value;
+                    v_args.push(next_value);
                 }
                 break; // after spread we don't accept any new arguments
             } else {
@@ -72,7 +72,9 @@ impl Executable for New {
         }
 
         match func_object {
-            Value::Object(ref object) => object.construct(&v_args, &object.clone().into(), context),
+            JsValue::Object(ref object) => {
+                object.construct(&v_args, &object.clone().into(), context)
+            }
             _ => context
                 .throw_type_error(format!("{} is not a constructor", self.expr().to_string(),)),
         }

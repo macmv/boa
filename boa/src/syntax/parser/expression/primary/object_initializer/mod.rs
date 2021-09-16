@@ -9,6 +9,7 @@
 
 #[cfg(test)]
 mod tests;
+use crate::syntax::ast::node::{Identifier, PropertyName};
 use crate::syntax::lexer::TokenKind;
 use crate::{
     syntax::{
@@ -134,6 +135,53 @@ where
             return Ok(node::PropertyDefinition::SpreadObject(node));
         }
 
+        // ComputedPropertyName
+        // https://tc39.es/ecma262/#prod-ComputedPropertyName
+        if cursor.next_if(Punctuator::OpenBracket)?.is_some() {
+            let node = AssignmentExpression::new(false, self.allow_yield, self.allow_await)
+                .parse(cursor)?;
+            cursor.expect(Punctuator::CloseBracket, "expected token ']'")?;
+            let next_token = cursor.next()?.ok_or(ParseError::AbruptEnd)?;
+            match next_token.kind() {
+                TokenKind::Punctuator(Punctuator::Colon) => {
+                    let val = AssignmentExpression::new(false, self.allow_yield, self.allow_await)
+                        .parse(cursor)?;
+                    return Ok(node::PropertyDefinition::property(node, val));
+                }
+                TokenKind::Punctuator(Punctuator::OpenParen) => {
+                    return MethodDefinition::new(self.allow_yield, self.allow_await, node)
+                        .parse(cursor);
+                }
+                _ => {
+                    return Err(ParseError::unexpected(
+                        next_token,
+                        "expected AssignmentExpression or MethodDefinition",
+                    ))
+                }
+            }
+        }
+
+        // Peek for '}' or ',' to indicate shorthand property name
+        if let Some(next_token) = cursor.peek(1)? {
+            match next_token.kind() {
+                TokenKind::Punctuator(Punctuator::CloseBlock)
+                | TokenKind::Punctuator(Punctuator::Comma) => {
+                    let token = cursor.peek(0)?.ok_or(ParseError::AbruptEnd)?;
+                    if let TokenKind::Identifier(ident) = token.kind() {
+                        // ident is both the name and value in a shorthand property
+                        let name = ident.to_string();
+                        let value = Identifier::from(ident.to_owned());
+                        cursor.next()?.expect("token vanished"); // Consume the token.
+                        return Ok(node::PropertyDefinition::property(name, value));
+                    } else {
+                        // Anything besides an identifier is a syntax error
+                        return Err(ParseError::unexpected(token.clone(), "object literal"));
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let prop_name = cursor.next()?.ok_or(ParseError::AbruptEnd)?.to_string();
         if cursor.next_if(Punctuator::Colon)?.is_some() {
             let val = AssignmentExpression::new(true, self.allow_yield, self.allow_await)
@@ -176,7 +224,7 @@ where
 struct MethodDefinition {
     allow_yield: AllowYield,
     allow_await: AllowAwait,
-    identifier: String,
+    identifier: PropertyName,
 }
 
 impl MethodDefinition {
@@ -185,7 +233,7 @@ impl MethodDefinition {
     where
         Y: Into<AllowYield>,
         A: Into<AllowAwait>,
-        I: Into<String>,
+        I: Into<PropertyName>,
     {
         Self {
             allow_yield: allow_yield.into(),
@@ -204,16 +252,17 @@ where
     fn parse(self, cursor: &mut Cursor<R>) -> Result<Self::Output, ParseError> {
         let _timer = BoaProfiler::global().start_event("MethodDefinition", "Parsing");
 
-        let (methodkind, prop_name, params) = match self.identifier.as_str() {
-            idn @ "get" | idn @ "set"
-                if matches!(
-                    cursor.peek(0)?.map(|t| t.kind()),
-                    Some(&TokenKind::Identifier(_))
-                        | Some(&TokenKind::Keyword(_))
-                        | Some(&TokenKind::BooleanLiteral(_))
-                        | Some(&TokenKind::NullLiteral)
-                        | Some(&TokenKind::NumericLiteral(_))
-                ) =>
+        let (method_kind, prop_name, params) = match self.identifier {
+            PropertyName::Literal(ident)
+                if ["get", "set"].contains(&ident.as_ref())
+                    && matches!(
+                        cursor.peek(0)?.map(|t| t.kind()),
+                        Some(&TokenKind::Identifier(_))
+                            | Some(&TokenKind::Keyword(_))
+                            | Some(&TokenKind::BooleanLiteral(_))
+                            | Some(&TokenKind::NullLiteral)
+                            | Some(&TokenKind::NumericLiteral(_))
+                    ) =>
             {
                 let prop_name = cursor.next()?.ok_or(ParseError::AbruptEnd)?.to_string();
                 cursor.expect(
@@ -223,14 +272,14 @@ where
                 let first_param = cursor.peek(0)?.expect("current token disappeared").clone();
                 let params = FormalParameters::new(false, false).parse(cursor)?;
                 cursor.expect(Punctuator::CloseParen, "method definition")?;
-                if idn == "get" {
+                if ident.as_ref() == "get" {
                     if !params.is_empty() {
                         return Err(ParseError::unexpected(
                             first_param,
                             "getter functions must have no arguments",
                         ));
                     }
-                    (MethodDefinitionKind::Get, prop_name, params)
+                    (MethodDefinitionKind::Get, prop_name.into(), params)
                 } else {
                     if params.len() != 1 {
                         return Err(ParseError::unexpected(
@@ -238,17 +287,50 @@ where
                             "setter functions must have one argument",
                         ));
                     }
-                    (MethodDefinitionKind::Set, prop_name, params)
+                    (MethodDefinitionKind::Set, prop_name.into(), params)
+                }
+            }
+            PropertyName::Literal(ident)
+                if ["get", "set"].contains(&ident.as_ref())
+                    && matches!(
+                        cursor.peek(0)?.map(|t| t.kind()),
+                        Some(&TokenKind::Punctuator(Punctuator::OpenBracket))
+                    ) =>
+            {
+                cursor.expect(Punctuator::OpenBracket, "token vanished")?;
+                let prop_name =
+                    AssignmentExpression::new(false, self.allow_yield, self.allow_await)
+                        .parse(cursor)?;
+                cursor.expect(Punctuator::CloseBracket, "expected token ']'")?;
+                cursor.expect(
+                    TokenKind::Punctuator(Punctuator::OpenParen),
+                    "property method definition",
+                )?;
+                let first_param = cursor.peek(0)?.expect("current token disappeared").clone();
+                let params = FormalParameters::new(false, false).parse(cursor)?;
+                cursor.expect(Punctuator::CloseParen, "method definition")?;
+                if ident.as_ref() == "get" {
+                    if !params.is_empty() {
+                        return Err(ParseError::unexpected(
+                            first_param,
+                            "getter functions must have no arguments",
+                        ));
+                    }
+                    (MethodDefinitionKind::Get, prop_name.into(), params)
+                } else {
+                    if params.len() != 1 {
+                        return Err(ParseError::unexpected(
+                            first_param,
+                            "setter functions must have one argument",
+                        ));
+                    }
+                    (MethodDefinitionKind::Set, prop_name.into(), params)
                 }
             }
             prop_name => {
                 let params = FormalParameters::new(false, false).parse(cursor)?;
                 cursor.expect(Punctuator::CloseParen, "method definition")?;
-                (
-                    MethodDefinitionKind::Ordinary,
-                    prop_name.to_string(),
-                    params,
-                )
+                (MethodDefinitionKind::Ordinary, prop_name, params)
             }
         };
 
@@ -263,7 +345,7 @@ where
         )?;
 
         Ok(node::PropertyDefinition::method_definition(
-            methodkind,
+            method_kind,
             prop_name,
             FunctionExpr::new(None, params, body),
         ))
