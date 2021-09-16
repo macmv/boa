@@ -393,6 +393,20 @@ where
                             }
                         }
                     }
+                    // Class declarations act like `let`, not `var`.
+                    Node::ClassDecl(class) => {
+                        if var_declared_names.contains(class.name())
+                            || !lexically_declared_names.insert(class.name())
+                        {
+                            return Err(ParseError::lex(LexError::Syntax(
+                                format!("Redeclaration of variable `{}`", class.name()).into(),
+                                match cursor.peek(0)? {
+                                    Some(token) => token.span().end(),
+                                    None => Position::new(1, 1),
+                                },
+                            )));
+                        }
+                    }
                     _ => (),
                 }
             }
@@ -451,7 +465,9 @@ where
         let tok = cursor.peek(0)?.ok_or(ParseError::AbruptEnd)?;
 
         match *tok.kind() {
-            TokenKind::Keyword(Keyword::Function) | TokenKind::Keyword(Keyword::Async) => {
+            TokenKind::Keyword(Keyword::Function)
+            | TokenKind::Keyword(Keyword::Async)
+            | TokenKind::Keyword(Keyword::Class) => {
                 if strict_mode && self.in_block {
                     return Err(ParseError::lex(LexError::Syntax(
                         "Function declaration in blocks not allowed in strict mode".into(),
@@ -539,6 +555,12 @@ where
                 } else {
                     Ok(k.as_str().into())
                 }
+            }
+            TokenKind::Keyword(k @ Keyword::Get) | TokenKind::Keyword(k @ Keyword::Set) => {
+                Ok(k.as_str().into())
+            }
+            TokenKind::Keyword(k @ Keyword::Static) if !cursor.strict_mode() => {
+                Ok(k.as_str().into())
             }
             _ => Err(ParseError::expected(
                 vec![TokenKind::identifier("identifier")],

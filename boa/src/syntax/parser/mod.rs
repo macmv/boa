@@ -1,5 +1,6 @@
 //! Boa parser implementation.
 
+pub mod class;
 mod cursor;
 pub mod error;
 mod expression;
